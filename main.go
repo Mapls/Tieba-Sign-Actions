@@ -3,112 +3,308 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
-	"github.com/go-telegram-bot-api/telegram-bot-api"
+	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/go-github/github"
 	jsoniter "github.com/json-iterator/go"
 	"golang.org/x/oauth2"
 	"io/ioutil"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	url2 "net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-func main() {
-	exec()
+var cronType string
+var pageSize int = 15
+
+func init() {
+	flag.StringVar(&cronType, "cronType", "si", "set config `cronType`")
 }
 
+func main() {
+	flag.Parse()
+	exec()
+}
 func exec() {
 	bdusss := os.Getenv("BDUSS")
 	if bdusss == "" {
 		log.Println("环境变量必须设置BDUSS")
 	}
 	bdussArr := strings.Split(bdusss, "\n")
-	c := 0
-	rs := []SignTable{}
-	for _, bduss := range bdussArr {
-		start := time.Now().UnixNano() / 1e6
-		c++
-		totalCount := 0
-		cookieValidCount := 0
-		excepCount := 0
-		blackCount := 0
-		signCount := 0
-		bqCount := 0
-		supCount := 0
-		bdussMd5 := StrToMD5(bduss)
-		if !CheckBdussValid(bduss) {
-			log.Println("BDUSS失效")
-			st := []SignTable{
-				{"", bdussMd5, 0, 0, 0, 0, 0, "未签到", "未签到", 0, "", false, time.Now().UnixNano() / 1e6, 0},
+	userList := []User{}
+	if cronType == "si" {
+		rs := []SignTable{}
+		sts := make(chan SignTable, 5000)
+		Parallelize(5, len(bdussArr), func(piece int) {
+			bduss := bdussArr[piece]
+			bdussMd5 := StrToMD5(bduss)
+			if !CheckBdussValid(bduss) {
+				st := SignTable{"", "", bdussMd5, 0, 0, 0, 0, 0, "未签到", "未签到", 0, "", false, time.Now().UnixNano() / 1e6, 0, nil}
+				sts <- st
+			} else {
+				OneBtnToSign(bduss, sts)
 			}
-			rs = append(rs, st[0])
+		})
+		close(sts)
+		if isNotify() {
+			//将签到结果上传到github仓库
+			if os.Getenv("AUTH_AES_KEY") != "" {
+				userList = SaveUserList(bdussArr)
+			}
+			for st := range sts {
+				rs = append(rs, st)
+				if os.Getenv("AUTH_AES_KEY") != "" {
+					WriteSignDetailData(st.PageData, User{int64(st.Total), st.Name, st.Uid, st.HeadUrl, GetUidWithRandom(st.Uid, userList)})
+				}
+			}
+			ms := GenerateSignResult(0, rs, false)
+			fmt.Println(ms + "\n")
+			//telegram通知
+			TelegramNotifyResult(GenerateSignResult(1, rs, false))
+			//Server酱通知
+			ServerJiangNotify(GenerateSignResult(1, rs, true))
+			//通知完成更新通知次数
+			pushNotifyCount()
+			WriteSignData(rs)
 		} else {
-			tbs := GetTbs(bduss)
-			likedTbs, _ := GetLikedTiebas(bduss, "")
-			totalCount = len(likedTbs)
-			for _, tb := range likedTbs {
-				signR := SignOneTieBa(tb.Name, tb.Id, bduss, tbs)
-				if signR.ErrorCode == "1" {
-					cookieValidCount++
-				} else if signR.ErrorCode == "340006" || signR.ErrorCode == "300004" {
-					//贴吧目录出问题，加载数据失败2
-					excepCount++
-				} else if signR.ErrorCode == "340008" {
-					//黑名单
-					blackCount++
-				} else if signR.ErrorCode == "0" || signR.ErrorCode == "160002" || signR.ErrorCode == "199901" {
-					//签到成功、已经签到、账号封禁，签到不涨经验
-					signCount++
-				} else if signR.ErrorCode == "2280007" || signR.ErrorCode == "340011" || signR.ErrorCode == "1989004" {
-					//签到服务忙、签到过快、数据加载失败1
-					//三种情况需要重签
-					bqCount += Bq(tb.Name, tb.Id, bduss, tbs)
-				}
-				sup := CelebritySupport(bduss, "", tb.Id, tbs)
-				if sup == "已助攻" || sup == "助攻成功" {
-					supCount++
-				}
+			for st := range sts {
+				rs = append(rs, st)
 			}
-			wk := WenKuSign(bduss)
-			zd := WenKuSign(bduss)
-			profile := GetUserProfile(GetUid(bduss))
-			name := jsoniter.Get([]byte(profile), "user").Get("name").ToString()
-			nameShow := jsoniter.Get([]byte(profile), "user").Get("name_show").ToString()
-			portrait := jsoniter.Get([]byte(profile), "user").Get("portrait").ToString()
-			headUrl := "http://tb.himg.baidu.com/sys/portrait/item/" + portrait
+			ms := GenerateSignResult(0, rs, false)
+			fmt.Println(ms + "\n")
+		}
 
-			if nameShow != "" {
-				name = nameShow
+	} else {
+		replys := os.Getenv("REPLY")
+		if replys != "" {
+			var replyInfo []ReplyInfo
+			if err := jsoniter.Unmarshal([]byte(replys), &replyInfo); err != nil {
+				log.Println("err: ", err)
 			}
-			timespan := (time.Now().UnixNano()/1e6 - start)
-			st := []SignTable{
-				{name, bdussMd5, totalCount, signCount, bqCount, excepCount, blackCount, wk, zd, supCount, headUrl, true, time.Now().UnixNano() / 1e6, timespan},
+			for _, ri := range replyInfo {
+				profile := GetUserProfile(GetUid(ri.Bduss))
+				portrait := jsoniter.Get([]byte(profile), "user").Get("portrait").ToString()
+				name := jsoniter.Get([]byte(profile), "user").Get("name").ToString()
+				if isBan(portrait) {
+					TelegramNotifyResult(name + "[已被封禁]：\n回帖失败")
+				} else {
+					tbName := ri.TbName
+					tid := ri.Tid
+					rr := reply(ri.Bduss, GetTbs(ri.Bduss), tid, GetFid(tbName), tbName, RandMsg(), 2)
+					TelegramNotifyResult(name + "[正常]：\n" + rr)
+				}
 			}
-			rs = append(rs, st[0])
 		}
 	}
-	ms := GenerateSignResult(0, rs)
-	fmt.Println(ms + "\n")
-	//telegram通知
-	TelegramNOtifyResult(GenerateSignResult(1, rs))
-	//将签到结果写入json文件
-	WriteSignData(rs)
+
+}
+func SaveUserList(bdussArr []string) []User {
+	userList := []User{}
+	//从github上删除多余的文件
+	ghToken := os.Getenv("GH_TOKEN")
+	repoName := GetRepoName(ghToken)
+	for _, bduss := range bdussArr {
+		uid := GetUid(bduss)
+		profile := GetUserProfile(uid)
+		name := jsoniter.Get([]byte(profile), "user").Get("name").ToString()
+		nameShow := jsoniter.Get([]byte(profile), "user").Get("name_show").ToString()
+		cdnUrl := fmt.Sprintf("https://cdn.jsdelivr.net/gh/%s@latest/data/%s-%s.txt", repoName, uid, GetRandomString(4))
+		if nameShow != "" {
+			name = nameShow
+		}
+		portrait := jsoniter.Get([]byte(profile), "user").Get("portrait").ToString()
+		headUrl := "https://himg.baidu.com/sys/portrait/item/" + strings.Split(portrait, "?")[0]
+		userList = append(userList, User{0, name, uid, headUrl, cdnUrl})
+	}
+	rd, _ := ioutil.ReadDir("data")
+	for _, fi := range rd {
+		if !fi.IsDir() && fi.Name() != "sign.json" && fi.Name() != "users.txt" && fi.Name() != "nc" {
+			if len(ghToken) > 0 {
+				deleteFromGithub(ghToken, "data/"+fi.Name())
+			} else {
+				fmt.Println("没有配置$GH_TOKEN")
+			}
+		}
+	}
+	usersJson, _ := jsoniter.MarshalToString(userList)
+	usersJson, err := JsAesEncrypt(usersJson, os.Getenv("AUTH_AES_KEY"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	//ioutil.WriteFile("data/users.txt", []byte(usersJson), 0666)
+	if len(ghToken) > 0 {
+		pushToGithub(usersJson, ghToken, "data/users.txt")
+	} else {
+		fmt.Println("没有配置$GH_TOKEN")
+	}
+	return userList
+}
+func isBan(id string) bool {
+	r, _ := Fetch(fmt.Sprintf("https://tieba.baidu.com/home/main?id=%s&fr=userbar", id), nil, "", "")
+	if strings.Contains(r, "抱歉，您访问的用户已被屏蔽") {
+		return true
+	}
+	return false
+}
+func OneBtnToSign(bduss string, sts chan SignTable) {
+	tbs := GetTbs(bduss)
+	likedTbs, err := GetLikedTiebas(bduss, "")
+	if err != nil {
+		log.Println("err: ", err)
+	}
+	chs := make(chan ChanSignResult, 5000)
+	Parallelize(5, len(likedTbs), func(piece int) {
+		tb := likedTbs[piece]
+		//签到一个贴吧
+		SyncSignTieBa(tb, bduss, tbs, chs)
+	})
+	close(chs)
+	totalCount := len(likedTbs)
+	cookieValidCount := 0
+	excepCount := 0
+	blackCount := 0
+	signCount := 0
+	bqCount := 0
+	supCount := 0
+	bdussMd5 := StrToMD5(bduss)
+	pageData := []PageDetail{}
+	detailData := []SignDetail{}
+	var timespan int64
+	c := 0
+	page := 0
+	i := 0
+	for signR := range chs {
+		i++
+		detailData = append(detailData, SignDetail{signR.Name, signR.Avatar, signR.Level_id, signR.Cur_score, signR.Levelup_score, signR.ErrorCode, signR.RetMsg, signR.SignTime})
+		c++
+		if c == pageSize || i == totalCount {
+			p := Paginator(page, pageSize, totalCount)
+			p.List = detailData
+			pageData = append(pageData, p)
+			detailData = []SignDetail{}
+			c = 0
+		} else if c == 1 {
+			page++
+		}
+		timespan += signR.Timespan
+		if signR.ErrorCode == "1" {
+			cookieValidCount++
+		} else if signR.ErrorCode == "340006" || signR.ErrorCode == "300004" {
+			//贴吧目录出问题，加载数据失败2
+			excepCount++
+		} else if signR.ErrorCode == "340008" {
+			//黑名单
+			blackCount++
+		} else if signR.ErrorCode == "0" || signR.ErrorCode == "160002" || signR.ErrorCode == "199901" {
+			//签到成功、已经签到、账号封禁，签到不涨经验
+			signCount++
+		} else if signR.ErrorCode == "2280007" || signR.ErrorCode == "340011" || signR.ErrorCode == "1989004" {
+			//签到服务忙、签到过快、数据加载失败1
+			//三种情况需要重签
+			bqCount += Bq(signR.Fname, signR.Fid, bduss, tbs)
+		}
+		if signR.Sup == "已助攻" {
+			supCount++
+		}
+	}
+	wk := WenKuSign(bduss)
+	zd := WenKuSign(bduss)
+	uid := GetUid(bduss)
+	profile := GetUserProfile(uid)
+	name := jsoniter.Get([]byte(profile), "user").Get("name").ToString()
+	nameShow := jsoniter.Get([]byte(profile), "user").Get("name_show").ToString()
+	portrait := jsoniter.Get([]byte(profile), "user").Get("portrait").ToString()
+	headUrl := "https://himg.baidu.com/sys/portrait/item/" + strings.Split(portrait, "?")[0]
+	if nameShow != "" {
+		name = nameShow
+	}
+	st := SignTable{uid, name, bdussMd5, totalCount, signCount, bqCount, excepCount, blackCount, wk, zd, supCount, headUrl, true, time.Now().UnixNano() / 1e6, timespan, pageData}
+	sts <- st
+}
+func GetUidWithRandom(uid string, userList []User) string {
+	for _, u := range userList {
+		if u.Uid == uid {
+			strings.LastIndex(u.CDNDataUrl, "/")
+			ss := strings.Split(u.CDNDataUrl, "/")
+			return strings.Split(ss[len(ss)-1], ".")[0]
+		}
+	}
+	return uid
+}
+func SyncSignTieBa(tb LikedTieba, bduss string, tbs string, chs chan ChanSignResult) ChanSignResult {
+	signResult := SignOneTieBa(tb.Name, tb.Id, bduss, tbs)
+	sup := CelebritySupport(bduss, "", tb.Id, tbs)
+	if sup == "已助攻" || sup == "助攻成功" {
+		sup = "已助攻"
+	} else {
+		sup = "未助攻"
+	}
+	csr := ChanSignResult{tb.Id, tb.Name, sup, signResult.ErrorMsg, signResult, tb}
+	//名人堂助攻
+	chs <- csr
+	return csr
 }
 
-func TelegramNOtifyResult(ms string) {
+type ChanSignResult struct {
+	Fid    string `json:"fid"`
+	Fname  string `json:"fname"`
+	Sup    string `json:"sup"`
+	RetMsg string `json:"ret_msg"`
+	SignResult
+	LikedTieba
+}
+type PageDetail struct {
+	List       []SignDetail `json:"list"`        //list数据
+	PageNo     int          `json:"page_no"`     //当前页码
+	PageSize   int          `json:"page_size"`   //每页大小
+	Pages      []int        `json:"pages"`       //页码
+	TotalPages int          `json:"total_pages"` //总页数
+	Total      int          `json:"total"`       //总数
+	FirstPage  int          `json:"first_page"`
+	LastPage   int          `json:"last_page"`
+}
+type SignDetail struct {
+	Name         string `json:"name"`
+	Avatar       string `json:"avatar"`
+	LevelId      string `json:"level_id"`
+	CurScore     string `json:"cur_score"`
+	LevelupScore string `json:"levelup_score"`
+	ErrorCode    string `json:"error_code"`
+	RetMsg       string `json:"ret_msg"`
+	SignTime     int64  `json:"sign_time"`
+}
+type SignDetailResult struct {
+	Data []PageDetail `json:"data"`
+	User User         `json:"user"`
+}
+type User struct {
+	Total      int64  `json:"total"`
+	Name       string `json:"name"`
+	Uid        string `json:"uid"`
+	HeadUrl    string `json:"head_url"`
+	CDNDataUrl string `json:"cdn_data_url"`
+}
+
+func TelegramNotifyResult(ms string) {
 	token := os.Getenv("TELEGRAM_APITOKEN")
 	chectId := os.Getenv("TELEGRAM_CHAT_ID")
 	if token == "" || chectId == "" {
-		log.Println("如需开启telegram通知，请设置环境变量ELEGRAM_APITOKEN和TELEGRAM_CHAT_ID")
+		log.Println("[Telegram]通知：关闭")
 	} else {
 		bot, err := tgbotapi.NewBotAPI(token)
 		if err != nil {
@@ -119,15 +315,36 @@ func TelegramNOtifyResult(ms string) {
 		//log.Println("Authorized on account %s", bot.Self.UserName)
 		msg := tgbotapi.NewMessage(chectIdInt64, ms)
 		bot.Send(msg)
+		log.Println("[Telegram]通知：成功")
+	}
+}
+func ServerJiangNotify(ms string) {
+
+	SCKEY := os.Getenv("SCKEY")
+	if SCKEY == "" {
+		log.Println("[Server酱]通知：关闭")
+	} else {
+		var postData = map[string]interface{}{
+			"text": "[T-S-A]签到结果-" + time.Now().Format("20060102"),
+			"desp": ms,
+		}
+		result, error := Fetch(fmt.Sprintf("https://sc.ftqq.com/%s.send", SCKEY), postData, "", "")
+		if error == nil && jsoniter.Get([]byte(result), "errno").ToInt() == 0 {
+			log.Println("[Server酱]通知：成功")
+		}
 	}
 }
 
-func GenerateSignResult(t int, rs []SignTable) string {
-	s := "贴吧ID: " + strconv.Itoa(len(rs)) + "\n"
+func GenerateSignResult(t int, rs []SignTable, isSJ bool) string {
+	newLine := "\n"
+	if isSJ {
+		newLine += "\n"
+	}
+	s := "贴吧ID: " + strconv.Itoa(len(rs)) + newLine
 	if len(rs) == 1 && t == 0 {
-		s = "贴吧ID: " + HideName(rs[0].Name) + "\n"
+		s = "贴吧ID: " + HideName(rs[0].Name) + newLine
 	} else if len(rs) == 1 && t == 1 {
-		s = "贴吧ID: " + rs[0].Name + "\n"
+		s = "贴吧ID: " + rs[0].Name + newLine
 	}
 	total := []string{}
 	Signed := []string{}
@@ -140,9 +357,9 @@ func GenerateSignResult(t int, rs []SignTable) string {
 	for i, r := range rs {
 		if len(rs) > 1 {
 			if t == 0 {
-				s += "\t" + strconv.Itoa(i+1) + ". " + HideName(r.Name) + "\n"
+				s += "\t" + strconv.Itoa(i+1) + ". " + HideName(r.Name) + newLine
 			} else {
-				s += "\t" + strconv.Itoa(i+1) + ". " + r.Name + "\n"
+				s += "\t" + strconv.Itoa(i+1) + ". " + r.Name + newLine
 			}
 		}
 		total = append(total, strconv.Itoa(r.Total))
@@ -154,14 +371,22 @@ func GenerateSignResult(t int, rs []SignTable) string {
 		wk = append(wk, r.Wenku)
 		zd = append(zd, r.Zhidao)
 	}
-	s += "总数:" + strings.Join(total, "‖") + "\n"
-	s += "已签到:" + strings.Join(Signed, "‖") + "\n"
-	s += "补签:" + strings.Join(Bq, "‖") + "\n"
-	s += "异常:" + strings.Join(Excep, "‖") + "\n"
-	s += "黑名单:" + strings.Join(Black, "‖") + "\n"
-	s += "名人堂助攻 :" + strings.Join(Support, "‖") + "\n"
-	s += "文库:" + strings.Join(wk, "‖") + "\n"
-	s += "知道:" + strings.Join(zd, "‖")
+	s += "总数:" + strings.Join(total, "‖") + newLine
+	s += "已签到:" + strings.Join(Signed, "‖") + newLine
+	s += "补签:" + strings.Join(Bq, "‖") + newLine
+	s += "异常:" + strings.Join(Excep, "‖") + newLine
+	s += "黑名单:" + strings.Join(Black, "‖") + newLine
+	s += "名人堂助攻 :" + strings.Join(Support, "‖") + newLine
+	s += "文库:" + strings.Join(wk, "‖") + newLine
+	s += "知道:" + strings.Join(zd, "‖") + newLine
+	if os.Getenv("AUTH_AES_KEY") != "" && os.Getenv("HOME_URL") != "" {
+		url := os.Getenv("HOME_URL") + "/tb.html?k=" + os.Getenv("AUTH_AES_KEY")
+		/*body, err := Fetch("https://api.d5.nz/api/dwz/url.php?url="+url, nil, "", "")
+		if err == nil && jsoniter.Get([]byte(body), "code").ToString() == "200" {
+			url = jsoniter.Get([]byte(body), "url").ToString()
+		}*/
+		s += "签到详情:" + url
+	}
 	return s
 }
 
@@ -195,20 +420,22 @@ func Bq(tbName string, fid string, bduss string, tbs string) int {
 }
 
 type SignTable struct {
-	Name     string `json:"name"`
-	BdussMd5 string `json:"bduss_md5"`
-	Total    int    `json:"total"`
-	Signed   int    `json:"signed"`
-	Bq       int    `json:"bq"`
-	Excep    int    `json:"excep"`
-	Black    int    `json:"black"`
-	Wenku    string `json:"wenku"`
-	Zhidao   string `json:"zhidao"`
-	Support  int    `json:"support"`
-	HeadUrl  string `json:"head_url"`
-	IsValid  bool   `json:"is_valid"`
-	SignTime int64  `json:"sign_time"`
-	Timespan int64  `json:"timespan"`
+	Uid      string       `json:"uid"`
+	Name     string       `json:"name"`
+	BdussMd5 string       `json:"bduss_md5"`
+	Total    int          `json:"total"`
+	Signed   int          `json:"signed"`
+	Bq       int          `json:"bq"`
+	Excep    int          `json:"excep"`
+	Black    int          `json:"black"`
+	Wenku    string       `json:"wenku"`
+	Zhidao   string       `json:"zhidao"`
+	Support  int          `json:"support"`
+	HeadUrl  string       `json:"head_url"`
+	IsValid  bool         `json:"is_valid"`
+	SignTime int64        `json:"sign_time"`
+	Timespan int64        `json:"timespan"`
+	PageData []PageDetail `json:"page_data"`
 }
 
 type SignResult struct {
@@ -357,6 +584,81 @@ func GetLikedTiebas(bduss string, uid string) ([]LikedTieba, error) {
 		}
 	}
 	return likedTiebaList, nil
+}
+
+//回帖
+func reply(bduss, tbs, tid, fid, tbName, content string, clientType int) string {
+	ct := "2"
+	if clientType == 0 {
+		ct = strconv.FormatInt(RandInt64(1, 4), 10)
+	} else {
+		ct = strconv.Itoa(clientType)
+	}
+	var postData = map[string]interface{}{
+		"BDUSS":           bduss,
+		"_client_type":    ct,
+		"_client_version": "11.7.8.1",
+		"_phone_imei":     "000000000000000",
+		"anonymous":       "1",
+		"content":         content,
+		"fid":             fid,
+		"from":            "1008621x",
+		"is_ad":           "0",
+		"kw":              tbName,
+		"model":           "MI+5",
+		"net_type":        "1",
+		"new_vcode":       "1",
+		"tbs":             tbs,
+		"tid":             tid,
+		"timestamp":       strconv.FormatInt(time.Now().UnixNano()/1e6, 10),
+		"vcode_tag":       "11",
+	}
+	postData["sign"] = DataSign(postData)
+	headers := make(map[string]string)
+	headers["User-Agent"] = "bdtb for Android 11.7.8.1"
+	headers["Host"] = "c.tieba.baidu.com"
+	body, err := FetchWithHeaders("http://c.tieba.baidu.com/c/c/post/add", postData, "", "", headers)
+	if err != nil {
+		log.Println("err: ", err)
+	}
+	j := jsoniter.Get([]byte(body))
+	if j.Get("error_code").ToString() == "0" {
+		pid := j.Get("pid").ToString()
+		return "回帖成功：" + fmt.Sprintf("https://tieba.baidu.com/p/%s?fid=%s&pid=%s#%s", tid, fid, pid, pid)
+	} else {
+		return "回帖失败：" + body
+	}
+}
+
+type ReplyInfo struct {
+	Bduss      string `json:"bduss"`
+	Tid        string `json:"tid"`
+	TbName     string `json:"tb_name"`
+	ClientType int    `json:"client_type"`
+}
+
+func RandMsg() string {
+	urls := []string{"https://v1.hitokoto.cn/?encode=json", "https://api.forismatic.com/api/1.0/?method=getQuote&format=json&lang=en"}
+	RandInt64(0, 1)
+	rand.Seed(time.Now().UnixNano())
+	i := rand.Intn(2)
+	body, err := Fetch(urls[i], nil, "", "")
+	if err != nil {
+		fmt.Println("err-50: ", err)
+	}
+	if i == 0 {
+		return jsoniter.Get([]byte(body), "hitokoto").ToString()
+	} else {
+		return jsoniter.Get([]byte(body), "quoteText").ToString()
+	}
+}
+
+func RandInt64(min, max int64) int64 {
+	rand.Seed(time.Now().UnixNano())
+	if min >= max || min == 0 || max == 0 {
+		return max
+	}
+	return rand.Int63n(max-min) + min
 }
 
 //签到一个贴吧
@@ -633,15 +935,99 @@ func WriteSignData(rs []SignTable) {
 	}
 	sd := SignData{rs, tuc, ttc, tsc, tvc, tbec, tsuc}
 	signJson, _ := jsoniter.MarshalToString(sd)
-	//ioutil.WriteFile("data/sign.json", []byte(signJson),0666)
+	//ioutil.WriteFile("data/sign.json", []byte(signJson), 0666)
 	ghToken := os.Getenv("GH_TOKEN")
-	op := os.Getenv("OWNER_REPO")
-	if len(ghToken) > 0 && len(op) > 0 {
-		pushToGithub(signJson, ghToken, op)
+	if len(ghToken) > 0 {
+		pushToGithub(signJson, ghToken, "data/sign.json")
 	} else {
-		fmt.Println("没有配置$GH_TOKEN或$OWNER_REPO")
+		fmt.Println("没有配置$GH_TOKEN")
 	}
 
+}
+func WriteSignDetailData(pd []PageDetail, user User) {
+	os.Remove("data/" + user.Uid + ".txt")
+	sdr := SignDetailResult{pd, user}
+	csrsJson, _ := jsoniter.MarshalToString(sdr)
+	key := os.Getenv("AUTH_AES_KEY")
+	ciphertext, err := JsAesEncrypt(csrsJson, key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	//ioutil.WriteFile("data/"+user.CDNDataUrl+".txt", []byte(ciphertext), 0666)
+	ghToken := os.Getenv("GH_TOKEN")
+	if len(ghToken) > 0 {
+		pushToGithub(ciphertext, ghToken, "data/"+user.CDNDataUrl+".txt")
+	} else {
+		fmt.Println("没有配置$GH_TOKEN")
+	}
+}
+func Exists(path string) bool {
+	_, err := os.Stat(path) //os.Stat获取文件信息
+	if err != nil {
+		if os.IsExist(err) {
+			return true
+		}
+		return false
+	}
+	return true
+}
+func isNotify() bool {
+	nc := os.Getenv("NOTIFY_COUNT")
+	count := 1
+	if nc != "" {
+		c, err := strconv.Atoi(nc)
+		if err != nil {
+			log.Println("$NOTIFY_COUNT应该为数值类型")
+		} else {
+			count = c
+		}
+	}
+	if !Exists("data/nc") {
+		return true
+	}
+	ncBlob, _ := ioutil.ReadFile("data/nc")
+	date := strings.Split(string(ncBlob), ":")[0]
+	if len(strings.Split(string(ncBlob), ":")) > 1 {
+		notifyedCount, _ := strconv.Atoi(strings.Split(string(ncBlob), ":")[1])
+		timelocal, _ := time.LoadLocation("Asia/Shanghai")
+		time.Local = timelocal
+		curNow := time.Now().Local()
+		curDate := curNow.Format("2006-01-02")
+		if date != curDate {
+			return true
+		} else {
+			if notifyedCount < count {
+				return true
+			}
+		}
+	} else {
+		return true
+	}
+
+	return false
+}
+func pushNotifyCount() {
+	timelocal, _ := time.LoadLocation("Asia/Shanghai")
+	time.Local = timelocal
+	curNow := time.Now().Local()
+	curDate := curNow.Format("2006-01-02")
+	if !Exists("data/nc") && os.Getenv("GH_TOKEN") != "" {
+		pushToGithub(curDate+":"+"1", os.Getenv("GH_TOKEN"), "data/nc")
+	} else {
+		ncBlob, _ := ioutil.ReadFile("data/nc")
+		date := strings.Split(string(ncBlob), ":")[0]
+		if len(strings.Split(string(ncBlob), ":")) > 1 {
+			notifyedCount, _ := strconv.Atoi(strings.Split(string(ncBlob), ":")[1])
+			if date != curDate {
+				pushToGithub(curDate+":"+"1", os.Getenv("GH_TOKEN"), "data/nc")
+			} else {
+				notifyedCount++
+				pushToGithub(date+":"+strconv.Itoa(notifyedCount), os.Getenv("GH_TOKEN"), "data/nc")
+			}
+		} else {
+			pushToGithub(curDate+":"+"1", os.Getenv("GH_TOKEN"), "data/nc")
+		}
+	}
 }
 
 type SignData struct {
@@ -664,9 +1050,8 @@ func GetByMd5(old []SignTable, bdussMd5 string) (*SignTable, error) {
 	return item, nil
 }
 
-func pushToGithub(data, token string, name string) error {
-	owner := strings.Split(name, "/")[0]
-	r := strings.Split(name, "/")[1]
+func pushToGithub(data, token, path string) error {
+	r := "Tieba-Sign-Actions"
 	if data == "" {
 		return errors.New("params error")
 	}
@@ -677,7 +1062,7 @@ func pushToGithub(data, token string, name string) error {
 
 	tc := oauth2.NewClient(ctx, ts)
 	client := github.NewClient(tc)
-	c := "签到完成上传结果数据：data/sign.json"
+	c := "签到完成上传结果数据：" + path
 	sha := ""
 	content := &github.RepositoryContentFileOptions{
 		Message: &c,
@@ -685,11 +1070,13 @@ func pushToGithub(data, token string, name string) error {
 		Branch:  github.String("master"),
 	}
 	op := &github.RepositoryContentGetOptions{}
-	repo, _, _, er := client.Repositories.GetContents(ctx, owner, r, "data/sign.json", op)
+	user, _, _ := client.Users.Get(ctx, "")
+	repo, _, _, er := client.Repositories.GetContents(ctx, user.GetLogin(), r, path, op)
 	if er != nil || repo == nil {
-		log.Println("get github repository error, create")
+		log.Println("get github repository error, create "+path, er)
 		content.Content = []byte(data)
-		_, _, err := client.Repositories.CreateFile(ctx, owner, r, "data/sign.json", content)
+		content.SHA = nil
+		_, _, err := client.Repositories.CreateFile(ctx, user.GetLogin(), r, path, content)
 		if err != nil {
 			log.Println(err)
 			return err
@@ -697,11 +1084,213 @@ func pushToGithub(data, token string, name string) error {
 	} else {
 		content.SHA = repo.SHA
 		content.Content = []byte(data)
-		_, _, err := client.Repositories.UpdateFile(ctx, owner, r, "data/sign.json", content)
+		_, _, err := client.Repositories.UpdateFile(ctx, user.GetLogin(), r, path, content)
 		if err != nil {
 			log.Println(err)
 			return err
 		}
 	}
 	return nil
+}
+
+func deleteFromGithub(token, path string) error {
+	r := "Tieba-Sign-Actions"
+	ctx := context.Background()
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	)
+	tc := oauth2.NewClient(ctx, ts)
+	client := github.NewClient(tc)
+	c := "删除多余数据文件：" + path
+	op := &github.RepositoryContentGetOptions{}
+	user, _, _ := client.Users.Get(ctx, "")
+	repo, _, _, _ := client.Repositories.GetContents(ctx, user.GetLogin(), r, path, op)
+	if repo == nil {
+		return nil
+	}
+	cop := &github.RepositoryContentFileOptions{
+		Message: &c,
+		SHA:     repo.SHA,
+		Branch:  github.String("master"),
+	}
+	_, _, err := client.Repositories.DeleteFile(ctx, user.GetLogin(), r, path, cop)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	return nil
+}
+func GetRepoName(token string) string {
+	r := "Tieba-Sign-Actions"
+	ctx := context.Background()
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	)
+	tc := oauth2.NewClient(ctx, ts)
+	client := github.NewClient(tc)
+	user, _, _ := client.Users.Get(ctx, "")
+	return user.GetLogin() + "/" + r
+}
+
+type DoWorkPieceFunc func(piece int)
+
+func Parallelize(workers, pieces int, doWorkPiece DoWorkPieceFunc) {
+	toProcess := make(chan int, pieces)
+	for i := 0; i < pieces; i++ {
+		toProcess <- i
+	}
+	close(toProcess)
+
+	if pieces < workers {
+		workers = pieces
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer utilruntime.HandleCrash()
+			defer wg.Done()
+			for piece := range toProcess {
+				doWorkPiece(piece)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+//---------------AES加密
+func JsAesDecrypt(hexS, key []byte) ([]byte, error) {
+	hexRaw, err := hex.DecodeString(string(hexS))
+	if err != nil {
+		return nil, err
+	}
+	if len(key) == 0 {
+		return nil, errors.New("key 不能为空")
+	}
+	pkey := paddingLeft(key, '0', 16)
+	block, err := aes.NewCipher(pkey) //选择加密算法
+	if err != nil {
+		return nil, fmt.Errorf("key 长度必须 16/24/32长度: %s", err)
+	}
+	blockModel := cipher.NewCBCDecrypter(block, pkey)
+	plantText := make([]byte, len(hexRaw))
+	blockModel.CryptBlocks(plantText, hexRaw)
+	plantText = pkcs7UnPadding(plantText)
+	return plantText, nil
+}
+
+func paddingLeft(ori []byte, pad byte, length int) []byte {
+	if len(ori) >= length {
+		return ori[:length]
+	}
+	pads := bytes.Repeat([]byte{pad}, length-len(ori))
+	return append(pads, ori...)
+}
+
+func JsAesEncrypt(raw string, key string) (string, error) {
+	origData := []byte(raw)
+	// 转成字节数组
+	if len(key) == 0 {
+		return "", errors.New("key 不能为空")
+	}
+	k := paddingLeft([]byte(key), '0', 16)
+
+	// 分组秘钥
+	block, err := aes.NewCipher(k)
+	if err != nil {
+		return "", fmt.Errorf("填充秘钥key的16位，24,32分别对应AES-128, AES-192, or AES-256  key 长度必须 16/24/32长度: %s", err)
+	}
+	// 获取秘钥块的长度
+	blockSize := block.BlockSize()
+	// 补全码
+	origData = pkcs7Padding(origData, blockSize)
+	// 加密模式
+	blockMode := cipher.NewCBCEncrypter(block, k)
+	// 创建数组
+	cryted := make([]byte, len(origData))
+	// 加密
+	blockMode.CryptBlocks(cryted, origData)
+	//使用RawURLEncoding 不要使用StdEncoding
+	//不要使用StdEncoding  放在url参数中会导致错误
+	return hex.EncodeToString(cryted), nil
+}
+
+func pkcs7UnPadding(plantText []byte) []byte {
+	length := len(plantText)
+	unpadding := int(plantText[length-1])
+	return plantText[:(length - unpadding)]
+}
+
+func pkcs7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padtext...)
+
+}
+
+func GetRandomString(l int) string {
+	str := "0123456789abcdefghijklmnopqrstuvwxyz"
+	bytes := []byte(str)
+	result := []byte{}
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < l; i++ {
+		result = append(result, bytes[r.Intn(len(bytes))])
+	}
+	return string(result)
+}
+
+func Paginator(page, pageSize int, total int) PageDetail {
+	var firstpage int //前一页地址
+	var lastpage int  //后一页地址
+	//根据nums总数，和prepage每页数量 生成分页总数
+	totalpages := int(math.Ceil(float64(total) / float64(pageSize))) //page总数
+	if page > totalpages {
+		page = totalpages
+	}
+	if page <= 0 {
+		page = 1
+	}
+	var pages []int
+	switch {
+	case page >= totalpages-5 && totalpages > 5: //最后5页
+		start := totalpages - 5 + 1
+		firstpage = page - 1
+		lastpage = int(math.Min(float64(totalpages), float64(page+1)))
+		pages = make([]int, 5)
+		for i, _ := range pages {
+			pages[i] = start + i
+		}
+	case page >= 3 && totalpages > 5:
+		start := page - 3 + 1
+		pages = make([]int, 5)
+		firstpage = page - 3
+		for i, _ := range pages {
+			pages[i] = start + i
+		}
+		firstpage = page - 1
+		lastpage = page + 1
+	default:
+		pages = make([]int, int(math.Min(5, float64(totalpages))))
+		for i, _ := range pages {
+			pages[i] = i + 1
+		}
+		firstpage = int(math.Max(float64(1), float64(page-1)))
+		lastpage = page + 1
+		//fmt.Println(pages)
+	}
+	totalPages := 0
+	if total%pageSize == 0 {
+		totalPages = total / pageSize
+	} else {
+		totalPages = total/pageSize + 1
+	}
+	pd := PageDetail{}
+	pd.Pages = pages
+	pd.Total = total
+	pd.FirstPage = firstpage
+	pd.LastPage = lastpage
+	pd.PageNo = page
+	pd.TotalPages = totalPages
+	return pd
 }
